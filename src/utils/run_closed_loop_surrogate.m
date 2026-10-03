@@ -14,6 +14,13 @@ function [theta_out, t_out] = run_closed_loop_surrogate(gains, surrogate_net, pa
 %                Q_notch, enable_notch, sim_time, theta_target, move_time
 % 出力: theta_out - theta_aの時系列（surrogate_net.Tsレート）
 %       t_out - 対応する時刻ベクトル
+%
+% 重要: 速度ループ(PI制御・ノッチフィルタ)はparams.Ts_vel(実機の設計レート,
+% 既定1kHz)でのみ更新し、tau指令はその間ZOH保持する。サロゲートの計算レート
+% (surrogate_net.Ts, 既定2kHz)で毎ステップ更新すると、実際のカスケード制御器
+% (cascade_controller.slx)より速い離散化レートでPI/ノッチが動作することになり、
+% 同じゲイン値でも実機と異なる(より安定した)挙動を示してしまう
+% （Phase6初版のバグ。Phase7で発覚し修正。詳細はIssue #6参照）。
 % 作成日: 2026-10-03
 
     Kp_pos = gains(1);
@@ -31,16 +38,18 @@ function [theta_out, t_out] = run_closed_loop_surrogate(gains, surrogate_net, pa
     theta_ref_vec = interp1(t_ref, theta_ref_raw, t_out, 'previous', 'extrap');
 
     if params.enable_notch
-        [nb, na] = design_notch(params.f_notch, params.depth_dB, params.Q_notch, 1/Ts);
+        [nb, na] = design_notch(params.f_notch, params.depth_dB, params.Q_notch, 1/params.Ts_vel);
     else
         nb = 1; na = 1;
     end
 
     pos_update_every = max(1, round(params.Ts_pos/Ts));
+    vel_update_every = max(1, round(params.Ts_vel/Ts));
 
     state = [0;0;0;0]; % theta_a, omega_a, theta_m, spring_defl_rate
     int_err = 0;
     omega_d = 0;
+    tau_cmd = 0;
     theta_out = zeros(N,1);
     omega_a_raw_prev = zeros(2,1);
     omega_a_filt_prev = zeros(2,1);
@@ -52,23 +61,25 @@ function [theta_out, t_out] = run_closed_loop_surrogate(gains, surrogate_net, pa
             omega_d = Kp_pos * (theta_ref_vec(k) - state(1));
         end
 
-        omega_a_raw = state(2);
-        if params.enable_notch
-            omega_a_filt = nb(1)*omega_a_raw + nb(2)*omega_a_raw_prev(1) + nb(3)*omega_a_raw_prev(2) ...
-                           - na(2)*omega_a_filt_prev(1) - na(3)*omega_a_filt_prev(2);
-            omega_a_raw_prev = [omega_a_raw; omega_a_raw_prev(1)];
-            omega_a_filt_prev = [omega_a_filt; omega_a_filt_prev(1)];
-        else
-            omega_a_filt = omega_a_raw;
-        end
+        if mod(k-1, vel_update_every) == 0
+            omega_a_raw = state(2);
+            if params.enable_notch
+                omega_a_filt = nb(1)*omega_a_raw + nb(2)*omega_a_raw_prev(1) + nb(3)*omega_a_raw_prev(2) ...
+                               - na(2)*omega_a_filt_prev(1) - na(3)*omega_a_filt_prev(2);
+                omega_a_raw_prev = [omega_a_raw; omega_a_raw_prev(1)];
+                omega_a_filt_prev = [omega_a_filt; omega_a_filt_prev(1)];
+            else
+                omega_a_filt = omega_a_raw;
+            end
 
-        err_v = omega_d - omega_a_filt;
-        int_err_new = int_err + err_v*Ts;
-        tau_cmd = Kp_vel*err_v + Ki_vel*int_err_new;
-        if tau_cmd > params.tau_max || tau_cmd < -params.tau_max
-            tau_cmd = max(min(tau_cmd, params.tau_max), -params.tau_max);
-        else
-            int_err = int_err_new; % アンチワインドアップ(飽和時は積分を更新しない)
+            err_v = omega_d - omega_a_filt;
+            int_err_new = int_err + err_v*params.Ts_vel;
+            tau_cmd = Kp_vel*err_v + Ki_vel*int_err_new;
+            if tau_cmd > params.tau_max || tau_cmd < -params.tau_max
+                tau_cmd = max(min(tau_cmd, params.tau_max), -params.tau_max);
+            else
+                int_err = int_err_new; % アンチワインドアップ(飽和時は積分を更新しない)
+            end
         end
 
         if k < N
